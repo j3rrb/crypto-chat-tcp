@@ -1,20 +1,72 @@
+mod algos;
+mod constants;
+mod structs;
+mod traits;
+
 use futures_util::{SinkExt, StreamExt};
-use std::env;
+use std::boxed::Box;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
+use traits::{Decryptor, Encryptor};
 use uuid::Uuid;
+
+use crate::structs::DiffieHellman;
 
 type Tx = tokio::sync::mpsc::UnboundedSender<Message>;
 type PeerList = Arc<Mutex<Vec<(Uuid, Tx)>>>;
 
+fn choose_algorithm(option: u32) -> Option<(Box<dyn Encryptor>, Box<dyn Decryptor>)> {
+    match option {
+        1 => Some((
+            Box::new(DiffieHellman::new()),
+            Box::new(DiffieHellman::new()),
+        )),
+        _ => None,
+    }
+}
+
+// TODO: Decrypt on client-side
+
 #[tokio::main]
 async fn main() {
-    let addr = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    let mut option: u32;
+
+    loop {
+        println!("\nDigite qual algoritmo será utilizado:");
+        println!("1 - Diffie-Hellmann + Ceasar");
+        println!("0 - Sair");
+
+        let mut input = String::new();
+
+        match std::io::stdin().read_line(&mut input) {
+            Ok(_) => {}
+            Err(e) => {
+                println!("Erro ao ler entrada: {}", e);
+                continue;
+            }
+        }
+
+        option = match input.trim().parse() {
+            Ok(num) => num,
+            Err(_) => {
+                println!("Entrada inválida.");
+                continue;
+            }
+        };
+
+        match choose_algorithm(option) {
+            Some(_) => break,
+            None => {
+                println!("\nOpção inválida!");
+                continue;
+            }
+        }
+    }
+
+    let addr = "127.0.0.1:8080".to_string();
     let addr: SocketAddr = addr.parse().expect("Invalid address");
 
     let listener = TcpListener::bind(&addr).await.expect("Failed to bind");
@@ -24,11 +76,11 @@ async fn main() {
 
     while let Ok((stream, _)) = listener.accept().await {
         let peers = Arc::clone(&peers);
-        tokio::spawn(handle_connection(stream, peers));
+        tokio::spawn(handle_connection(stream, peers, option));
     }
 }
 
-async fn handle_connection(stream: TcpStream, peers: PeerList) {
+async fn handle_connection(stream: TcpStream, peers: PeerList, option: u32) {
     let client_id = Uuid::new_v4();
     println!("New client connected: {}", client_id);
 
@@ -48,12 +100,23 @@ async fn handle_connection(stream: TcpStream, peers: PeerList) {
         peers.push((client_id, tx));
     }
 
-    let _ = sender.send(Message::Text(format!("Seu ID: {}", client_id))).await;
+    let _ = sender
+        .send(Message::Text(format!("Seu ID: {}", client_id)))
+        .await;
 
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if sender.send(msg).await.is_err() {
-                break;
+            match choose_algorithm(option) {
+                Some((encryptor, _)) => match encryptor.encrypt(&msg.to_string()) {
+                    Ok(encrypted) => {
+                        if let Err(e) = sender.send(Message::Text(encrypted)).await {
+                            println!("Erro ao enviar mensagem: {:?}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => println!("Erro ao criptografar: {}", e),
+                },
+                None => println!("Erro"),
             }
         }
     });
@@ -61,17 +124,25 @@ async fn handle_connection(stream: TcpStream, peers: PeerList) {
     while let Some(msg) = receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                // Mensagem a ser enviada apenas para outros clientes
-                let broadcast_msg = Message::Text(format!("{}: {}", client_id, text));
-                let peers = peers.lock().unwrap();
-                for (id, peer) in peers.iter() {
-                    if *id == client_id {
-                        // Envia a mensagem "Você" apenas para o cliente que enviou
-                        let _ = peer.send(Message::Text(format!("Você: {}", text)));
-                    } else {
-                        // Envia a mensagem com o ID do remetente para os outros
-                        let _ = peer.send(broadcast_msg.clone());
-                    }
+                match choose_algorithm(option) {
+                    Some((_, decryptor)) => match decryptor.decrypt(&text.to_string()) {
+                        Ok(decrypted) => {
+                            let broadcast_msg =
+                                Message::Text(format!("{}: {}", client_id, decrypted));
+                            let peers = peers.lock().unwrap();
+
+                            for (id, peer) in peers.iter() {
+                                if *id == client_id {
+                                    let _ =
+                                        peer.send(Message::Text(decrypted.to_string()));
+                                } else {
+                                    let _ = peer.send(broadcast_msg.clone());
+                                }
+                            }
+                        }
+                        Err(e) => println!("Erro ao descriptografar: {}", e),
+                    },
+                    None => println!(""),
                 }
             }
             Ok(Message::Close(_)) => break,
