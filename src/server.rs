@@ -28,8 +28,6 @@ fn choose_algorithm(option: u32) -> Option<(Box<dyn Encryptor>, Box<dyn Decrypto
     }
 }
 
-// TODO: Decrypt on client-side
-
 #[tokio::main]
 async fn main() {
     let mut option: u32;
@@ -100,9 +98,17 @@ async fn handle_connection(stream: TcpStream, peers: PeerList, option: u32) {
         peers.push((client_id, tx));
     }
 
-    let _ = sender
-        .send(Message::Text(format!("Seu ID: {}", client_id)))
-        .await;
+    {
+        let _ = sender
+            .send(Message::Text(format!("Seu ID: {}", client_id)))
+            .await;
+    }
+
+    {
+        let _ = sender
+            .send(Message::Text(format!("option: {}", option)))
+            .await;
+    }
 
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -123,28 +129,24 @@ async fn handle_connection(stream: TcpStream, peers: PeerList, option: u32) {
 
     while let Some(msg) = receiver.next().await {
         match msg {
-            Ok(Message::Text(text)) => {
-                match choose_algorithm(option) {
-                    Some((_, decryptor)) => match decryptor.decrypt(&text.to_string()) {
-                        Ok(decrypted) => {
-                            let broadcast_msg =
-                                Message::Text(format!("{}: {}", client_id, decrypted));
-                            let peers = peers.lock().unwrap();
+            Ok(Message::Text(text)) => match choose_algorithm(option) {
+                Some((_, decryptor)) => match decryptor.decrypt(&text.to_string()) {
+                    Ok(decrypted) => {
+                        let broadcast_msg = Message::Text(format!("{}: {}", client_id, decrypted));
+                        let peers = peers.lock().unwrap();
 
-                            for (id, peer) in peers.iter() {
-                                if *id == client_id {
-                                    let _ =
-                                        peer.send(Message::Text(decrypted.to_string()));
-                                } else {
-                                    let _ = peer.send(broadcast_msg.clone());
-                                }
+                        for (id, peer) in peers.iter() {
+                            if *id == client_id {
+                                let _ = peer.send(Message::Text(decrypted.to_string()));
+                            } else {
+                                let _ = peer.send(broadcast_msg.clone());
                             }
                         }
-                        Err(e) => println!("Erro ao descriptografar: {}", e),
-                    },
-                    None => println!(""),
-                }
-            }
+                    }
+                    Err(e) => println!("Erro ao descriptografar: {}", e),
+                },
+                None => println!(""),
+            },
             Ok(Message::Close(_)) => break,
             Ok(_) => (),
             Err(e) => {
