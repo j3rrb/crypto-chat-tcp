@@ -1,87 +1,42 @@
-mod algos;
-mod constants;
-mod structs;
-mod traits;
-
 use futures_util::{SinkExt, StreamExt};
-use std::boxed::Box;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use traits::{Decryptor, Encryptor};
 use uuid::Uuid;
 
-use crate::structs::DiffieHellman;
-
 type Tx = tokio::sync::mpsc::UnboundedSender<Message>;
-type PeerList = Arc<Mutex<Vec<(Uuid, Tx)>>>;
-
-fn choose_algorithm(option: u32) -> Option<(Box<dyn Encryptor>, Box<dyn Decryptor>)> {
-    match option {
-        1 => Some((
-            Box::new(DiffieHellman::new()),
-            Box::new(DiffieHellman::new()),
-        )),
-        _ => None,
-    }
-}
+type PeerList = Arc<RwLock<Vec<(Uuid, Tx, Option<u32>)>>>;
 
 #[tokio::main]
 async fn main() {
-    let mut option: u32;
-
-    loop {
-        println!("\nDigite qual algoritmo será utilizado:");
-        println!("1 - Diffie-Hellmann + Ceasar");
-        println!("0 - Sair");
-
-        let mut input = String::new();
-
-        match std::io::stdin().read_line(&mut input) {
-            Ok(_) => {}
-            Err(e) => {
-                println!("Erro ao ler entrada: {}", e);
-                continue;
-            }
-        }
-
-        option = match input.trim().parse() {
-            Ok(num) => num,
-            Err(_) => {
-                println!("Entrada inválida.");
-                continue;
-            }
-        };
-
-        match choose_algorithm(option) {
-            Some(_) => break,
-            None => {
-                println!("\nOpção inválida!");
-                continue;
-            }
-        }
-    }
-
     let addr = "127.0.0.1:8080".to_string();
     let addr: SocketAddr = addr.parse().expect("Invalid address");
 
+    // Cria o servidor WebSocket
     let listener = TcpListener::bind(&addr).await.expect("Failed to bind");
-    let peers = Arc::new(Mutex::new(Vec::new()));
+
+    // Declara um atômico para um vetor de mutexes, para os clients conectados
+    let peers = Arc::new(RwLock::new(Vec::new()));
 
     println!("Listening on: {}", addr);
 
     while let Ok((stream, _)) = listener.accept().await {
+        // Quando houver alguma conexão de um client aceita
+        // e cria uma task para manipular a conexão do usuário
         let peers = Arc::clone(&peers);
-        tokio::spawn(handle_connection(stream, peers, option));
+        tokio::spawn(handle_connection(stream, peers));
     }
 }
 
-async fn handle_connection(stream: TcpStream, peers: PeerList, option: u32) {
+async fn handle_connection(stream: TcpStream, peers: PeerList) {
+    // Cria um UUIDv4 para o usuário conectado
     let client_id = Uuid::new_v4();
     println!("New client connected: {}", client_id);
 
+    // Pega a stream para esse usuário
     let ws_stream = match accept_async(stream).await {
         Ok(ws) => ws,
         Err(e) => {
@@ -90,63 +45,84 @@ async fn handle_connection(stream: TcpStream, peers: PeerList, option: u32) {
         }
     };
 
-    let (mut sender, mut receiver) = ws_stream.split();
+    // "Separa" entre remetente e destinatário
+    let (sender, mut receiver) = ws_stream.split();
+
+    // Cria um atômico de mutex para o remetente
+    let sender = Arc::new(Mutex::new(sender));
+
+    // Cria um canal para envio e recebimento de mensagens
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
+    // Clona o remetente para um atômico
+    let sender_clone = Arc::clone(&sender);
+
+    // Trava o mutex dos clients e adiciona o cliente ao vetor
     {
-        let mut peers = peers.lock().unwrap();
-        peers.push((client_id, tx));
+        let mut peers = peers.write().await;
+        peers.push((client_id, tx, None));
     }
 
-    {
-        let _ = sender
-            .send(Message::Text(format!("Seu ID: {}", client_id)))
-            .await;
-    }
-
-    {
-        let _ = sender
-            .send(Message::Text(format!("option: {}", option)))
-            .await;
-    }
-
+    // Cria uma tarefa para envio das mensagens
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            match choose_algorithm(option) {
-                Some((encryptor, _)) => match encryptor.encrypt(&msg.to_string()) {
-                    Ok(encrypted) => {
-                        if let Err(e) = sender.send(Message::Text(encrypted)).await {
-                            println!("Erro ao enviar mensagem: {:?}", e);
-                            break;
-                        }
-                    }
-                    Err(e) => println!("Erro ao criptografar: {}", e),
-                },
-                None => println!("Erro"),
+            println!("Enviando mensagem: {}\n", msg);
+            if let Err(e) = sender_clone.lock().await.send(msg).await {
+                println!("Erro ao enviar mensagem: {:?}", e);
+                break;
             }
         }
     });
 
+    // Recebe a chave pública do outro client
+    if let Some(Ok(Message::Text(public_key_text))) = receiver.next().await {
+        if let Ok(public_key) = public_key_text.parse::<u32>() {
+            println!(
+                "Chave pública recebida do cliente {}: {}",
+                client_id, public_key
+            );
+
+            // Tranca o mutex de clients para escrita e envia a chave publica ao client solicitado
+            {
+                let mut peers_guard = peers.write().await;
+                if let Some(peer) = peers_guard.iter_mut().find(|(id, _, _)| *id == client_id) {
+                    peer.2 = Some(public_key);
+                }
+            }
+
+            // Tranca o mutex para leitura e envia a chave do client para outros clients
+            // menos o próprio client
+            let peers_guard = peers.read().await;
+            for (id, peer_tx, peer_public_key) in peers_guard.iter() {
+                if *id != client_id {
+                    // Verifica se a chave pública recebida é igual a chave do cliente
+                    if let Some(other_public_key) = peer_public_key {
+                        let msg = Message::Text(other_public_key.to_string());
+
+                        // Tranca o mutex do remetente e envia a chave pública
+                        let _ = sender.lock().await.send(msg).await;
+                    }
+
+                    // Envia a chave pública ao cliente
+                    let _ = peer_tx.send(Message::Text(public_key_text.clone()));
+                }
+            }
+        }
+    }
+
     while let Some(msg) = receiver.next().await {
         match msg {
-            Ok(Message::Text(text)) => match choose_algorithm(option) {
-                Some((_, decryptor)) => match decryptor.decrypt(&text.to_string()) {
-                    Ok(decrypted) => {
-                        let broadcast_msg = Message::Text(format!("{}: {}", client_id, decrypted));
-                        let peers = peers.lock().unwrap();
+            Ok(Message::Text(text)) => {
+                let broadcast_msg = Message::Text(text.clone());
+                let peers = peers.read().await;
 
-                        for (id, peer) in peers.iter() {
-                            if *id == client_id {
-                                let _ = peer.send(Message::Text(decrypted.to_string()));
-                            } else {
-                                let _ = peer.send(broadcast_msg.clone());
-                            }
-                        }
+                // Faz o broadcasting da mensagem para todos os outros clients conectados
+                for (id, peer, _) in peers.iter() {
+                    if *id != client_id {
+                        let _ = peer.send(broadcast_msg.clone());
                     }
-                    Err(e) => println!("Erro ao descriptografar: {}", e),
-                },
-                None => println!(""),
-            },
+                }
+            }
             Ok(Message::Close(_)) => break,
             Ok(_) => (),
             Err(e) => {
@@ -156,9 +132,11 @@ async fn handle_connection(stream: TcpStream, peers: PeerList, option: u32) {
         }
     }
 
+    // Se o cliente for desconectado, trava o mutext dos clientes para escrita
+    // e remove o cliente que desconectou da lista
     {
-        let mut peers = peers.lock().unwrap();
-        peers.retain(|(id, _)| *id != client_id);
+        let mut peers = peers.write().await;
+        peers.retain(|(id, _, _)| *id != client_id);
     }
 
     println!("Client disconnected: {}", client_id);
