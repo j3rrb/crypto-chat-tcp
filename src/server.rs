@@ -1,4 +1,7 @@
+extern crate lazy_static;
+
 use futures_util::{SinkExt, StreamExt};
+use lazy_static::lazy_static;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -8,7 +11,12 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use uuid::Uuid;
 
 type Tx = tokio::sync::mpsc::UnboundedSender<Message>;
-type PeerList = Arc<RwLock<Vec<(Uuid, Tx, Option<u32>)>>>;
+type PeerList = Arc<RwLock<Vec<(Uuid, Tx)>>>;
+type KEYRING = Arc<RwLock<Vec<(Uuid, Option<u32>)>>>;
+
+lazy_static! {
+    static ref Keyring: KEYRING = Arc::new(RwLock::new(vec![]));
+}
 
 #[tokio::main]
 async fn main() {
@@ -38,7 +46,19 @@ async fn handle_connection(stream: TcpStream, peers: PeerList) {
 
     // Pega a stream para esse usuário
     let ws_stream = match accept_async(stream).await {
-        Ok(ws) => ws,
+        Ok(mut ws) => {
+            match ws.send(Message::Text(client_id.to_string())).await {
+                Ok(_) => {
+                    println!("ID enviado com sucesso!")
+                }
+                Err(e) => {
+                    println!("Erro ao enviar o ID ao client! {}", e);
+                    return;
+                }
+            }
+
+            ws
+        }
         Err(e) => {
             println!("Error during the websocket handshake: {}", e);
             return;
@@ -54,74 +74,47 @@ async fn handle_connection(stream: TcpStream, peers: PeerList) {
     // Cria um canal para envio e recebimento de mensagens
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
-    // Clona o remetente para um atômico
-    let sender_clone = Arc::clone(&sender);
-
     // Trava o mutex dos clients e adiciona o cliente ao vetor
     {
+        let tx = tx.clone();
         let mut peers = peers.write().await;
-        peers.push((client_id, tx, None));
+        peers.push((client_id, tx));
+
+        let mut keyring = Keyring.write().await;
+        keyring.push((client_id, None))
     }
 
     // Cria uma tarefa para envio das mensagens
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            println!("Enviando mensagem: {}\n", msg);
-            if let Err(e) = sender_clone.lock().await.send(msg).await {
-                println!("Erro ao enviar mensagem: {:?}", e);
+            println!("Sending: {msg}");
+            if let Err(e) = sender.lock().await.send(msg).await {
+                println!("Error sending message: {:?}", e);
                 break;
             }
         }
     });
 
-    // Recebe a chave pública do outro client
-    if let Some(Ok(Message::Text(public_key_text))) = receiver.next().await {
-        if let Ok(public_key) = public_key_text.parse::<u32>() {
-            println!(
-                "Chave pública recebida do cliente {}: {}",
-                client_id, public_key
-            );
-
-            // Tranca o mutex de clients para escrita e envia a chave publica ao client solicitado
-            {
-                let mut peers_guard = peers.write().await;
-                if let Some(peer) = peers_guard.iter_mut().find(|(id, _, _)| *id == client_id) {
-                    peer.2 = Some(public_key);
-                }
-            }
-
-            // Tranca o mutex para leitura e envia a chave do client para outros clients
-            // menos o próprio client
-            let peers_guard = peers.read().await;
-            for (id, peer_tx, peer_public_key) in peers_guard.iter() {
-                if *id != client_id {
-                    // Verifica se a chave pública recebida é igual a chave do cliente
-                    if let Some(other_public_key) = peer_public_key {
-                        let msg = Message::Text(other_public_key.to_string());
-
-                        // Tranca o mutex do remetente e envia a chave pública
-                        let _ = sender.lock().await.send(msg).await;
-                    }
-
-                    // Envia a chave pública ao cliente
-                    let _ = peer_tx.send(Message::Text(public_key_text.clone()));
-                }
-            }
-        }
-    }
-
     while let Some(msg) = receiver.next().await {
         match msg {
             Ok(Message::Text(text)) => {
                 let broadcast_msg = Message::Text(text.clone());
-                let peers = peers.read().await;
 
-                // Faz o broadcasting da mensagem para todos os outros clients conectados
-                for (id, peer, _) in peers.iter() {
-                    if *id != client_id {
-                        let _ = peer.send(broadcast_msg.clone());
+                if text.starts_with("set_public_key:") {
+                    if let Some(key) = text.split(':').nth(1) {
+                        if let Ok(parsed_key) = key.parse() {
+                            update_keyring(client_id, parsed_key).await;
+                        }
                     }
+                    continue;
                 }
+
+                if text.starts_with("get_public_key") {
+                    tokio::spawn(exchange_keys(client_id, peers.clone()));
+                    continue;
+                }
+
+                broadcast_message(client_id, &peers, broadcast_msg).await;
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => (),
@@ -136,8 +129,101 @@ async fn handle_connection(stream: TcpStream, peers: PeerList) {
     // e remove o cliente que desconectou da lista
     {
         let mut peers = peers.write().await;
-        peers.retain(|(id, _, _)| *id != client_id);
+        peers.retain(|(id, _)| *id != client_id);
+
+        let mut keyring = Keyring.write().await;
+        keyring.retain(|(id, _)| *id != client_id)
     }
 
     println!("Client disconnected: {}", client_id);
+}
+
+async fn update_keyring(client_id: Uuid, key: u32) {
+    let mut keyring = Keyring.write().await;
+    if let Some((_, client_key)) = keyring.iter_mut().find(|(id, _)| *id == client_id) {
+        *client_key = Some(key);
+    }
+    println!("Updated keyring for client {}: {:?}", client_id, key);
+}
+
+async fn exchange_keys(client_id: Uuid, peers: PeerList) {
+    // Obtém as informações do cliente atual
+    let (other_id, client_key) = match retrieve_key_from_other(client_id).await {
+        Some(result) => result,
+        None => {
+            println!("No key found for client {}", client_id);
+            return;
+        }
+    };
+
+    // Obtém as informações do outro cliente
+    let (_, other_key) = match retrieve_key_from_other(other_id).await {
+        Some(result) => result,
+        None => {
+            println!("No key found for client {}", other_id);
+            return;
+        }
+    };
+
+    // Envia a chave do cliente atual para o outro cliente
+    if let Some(client_sender) = {
+        let peers = peers.read().await;
+        peers
+            .iter()
+            .find(|(id, _)| *id != other_id)
+            .map(|(_, sender)| sender.clone())
+    } {
+        if let Some(client_key) = client_key {
+            let msg = Message::Text(format!("get_public_key:{}", client_key));
+            if let Err(e) = client_sender.send(msg) {
+                eprintln!(
+                    "Error sending key from {} to {}: {:?}",
+                    client_id, other_id, e
+                );
+            } else {
+                println!("Key from {} sent to {}", client_id, other_id);
+            }
+        }
+    }
+
+    // Envia a chave do outro cliente para o cliente atual
+    if let Some(client_sender) = {
+        let peers = peers.read().await;
+        peers
+            .iter()
+            .find(|(id, _)| *id != client_id)
+            .map(|(_, sender)| sender.clone())
+    } {
+        if let Some(other_key) = other_key {
+            let msg = Message::Text(format!("get_public_key:{}", other_key));
+            if let Err(e) = client_sender.send(msg) {
+                eprintln!(
+                    "Error sending key from {} to {}: {:?}",
+                    other_id, client_id, e
+                );
+            } else {
+                println!("Key from {} sent to {}", other_id, client_id);
+            }
+        }
+    }
+}
+
+async fn retrieve_key_from_other(client_id: Uuid) -> Option<(Uuid, Option<u32>)> {
+    let keyring = Keyring.read().await;
+    keyring.iter().find_map(|(id, key)| {
+        if *id != client_id {
+            Some((*id, *key))
+        } else {
+            None
+        }
+    })
+}
+
+async fn broadcast_message(client_id: Uuid, peers: &PeerList, message: Message) {
+    let peers = peers.read().await;
+    for (id, peer) in peers.iter() {
+        if *id != client_id {
+            let _ = peer.send(message.clone());
+        }
+    }
 }

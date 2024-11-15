@@ -1,4 +1,4 @@
-pub fn mod_exp(base: u32, exponent: u32, modulus: u32) -> u32 {
+pub fn mod_exp(base: u16, exponent: u16, modulus: u16) -> u16 {
     let mut result = 1;
     let mut base = base % modulus;
     let mut exp = exponent;

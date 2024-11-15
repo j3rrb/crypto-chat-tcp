@@ -1,4 +1,4 @@
-pub fn caesar_cipher(text: &str, shift: u32) -> String {
+pub fn caesar_cipher(text: &str, shift: u16) -> String {
     text.chars()
         .map(|c| {
             if c.is_ascii_alphabetic() {

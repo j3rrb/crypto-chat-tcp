@@ -1,2 +1,2 @@
-pub const PRIME: u32 = 23;
-pub const BASE: u32 = 5;
+pub const PRIME: u16 = 23;
+pub const BASE: u16 = 5;
