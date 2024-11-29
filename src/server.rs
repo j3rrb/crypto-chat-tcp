@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 type Tx = tokio::sync::mpsc::UnboundedSender<Message>;
 type PeerList = Arc<RwLock<Vec<(Uuid, Tx)>>>;
-type KEYRING = Arc<RwLock<Vec<(Uuid, Option<u32>)>>>;
+type KEYRING = Arc<RwLock<Vec<(Uuid, Option<u16>)>>>;
 
 lazy_static! {
     static ref Keyring: KEYRING = Arc::new(RwLock::new(vec![]));
@@ -87,7 +87,7 @@ async fn handle_connection(stream: TcpStream, peers: PeerList) {
     // Cria uma tarefa para envio das mensagens
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            println!("Sending: {msg}");
+            println!("Sending {} to {}", msg, client_id);
             if let Err(e) = sender.lock().await.send(msg).await {
                 println!("Error sending message: {:?}", e);
                 break;
@@ -138,7 +138,7 @@ async fn handle_connection(stream: TcpStream, peers: PeerList) {
     println!("Client disconnected: {}", client_id);
 }
 
-async fn update_keyring(client_id: Uuid, key: u32) {
+async fn update_keyring(client_id: Uuid, key: u16) {
     let mut keyring = Keyring.write().await;
     if let Some((_, client_key)) = keyring.iter_mut().find(|(id, _)| *id == client_id) {
         *client_key = Some(key);
@@ -208,7 +208,7 @@ async fn exchange_keys(client_id: Uuid, peers: PeerList) {
     }
 }
 
-async fn retrieve_key_from_other(client_id: Uuid) -> Option<(Uuid, Option<u32>)> {
+async fn retrieve_key_from_other(client_id: Uuid) -> Option<(Uuid, Option<u16>)> {
     let keyring = Keyring.read().await;
     keyring.iter().find_map(|(id, key)| {
         if *id != client_id {

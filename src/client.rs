@@ -4,15 +4,17 @@ mod structs;
 mod traits;
 mod utils;
 
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use rand::{self, Rng};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{env, u16};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::sync::{watch, Mutex};
-use tokio::task;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use url::Url;
 use uuid::Uuid;
 
@@ -36,119 +38,170 @@ async fn main() {
 
     let (ws_sender, ws_receiver) = ws_stream.split();
 
-    let client_id = Arc::new(Mutex::<Uuid>::new(Uuid::nil()));
-    let private_key = Arc::new(Mutex::new(u16::MAX));
-    let public_key = Arc::new(Mutex::new(u16::MAX));
-    let ws_sender_mtx = Arc::new(Mutex::new(ws_sender));
-    let ws_receiver_mtx = Arc::new(Mutex::new(ws_receiver));
+    let self_id = Arc::new(Mutex::new(Uuid::nil()));
+    let self_private_key = Arc::new(Mutex::new(u16::MAX));
+    let self_public_key = Arc::new(Mutex::new(u16::MAX));
+    let (client_key_tx, _) = watch::channel::<u16>(u16::MAX);
+    let (can_type_tx, can_type_rx) = watch::channel::<bool>(false);
 
-    let (key_sender, key_receiver) = watch::channel(0u16);
-    let key_sender_mtx = Arc::new(Mutex::new(key_sender));
-    let key_receiver_mtx = Arc::new(Mutex::new(key_receiver));
+    let client_key_rx1 = client_key_tx.subscribe();
+    let client_key_rx2 = client_key_tx.subscribe();
 
-    let _id_task = {
-        let client_id_clone = Arc::clone(&client_id);
-        let ws_receiver_clone = Arc::clone(&ws_receiver_mtx);
+    let ws_sdr_mutex = Arc::new(Mutex::new(ws_sender));
+    let ws_rvr_mutex = Arc::new(Mutex::new(ws_receiver));
 
-        task::spawn({
-            async move {
-                while let Some(msg) = ws_receiver_clone.lock().await.next().await {
-                    match msg {
-                        Ok(Message::Text(id)) => {
-                            println!("Seu ID é: {}\n", id);
-                            match Uuid::from_str(id.as_str()) {
-                                Ok(uuid_str) => {
-                                    *client_id_clone.lock().await = uuid_str;
-                                    break;
-                                }
-                                Err(e) => eprintln!("Erro ao converter ID! {}", e),
-                            }
-                        }
-                        Ok(Message::Close(_)) => {
-                            println!("Server closed the connection");
+    tokio::spawn({
+        let private_key = Arc::clone(&self_private_key);
+        let public_key = Arc::clone(&self_public_key);
+        let sender = Arc::clone(&ws_sdr_mutex);
+
+        async move {
+            let mut private_key = private_key.lock().await;
+            let mut public_key = public_key.lock().await;
+            send_round_key(&mut private_key, &mut public_key, &mut *sender.lock().await).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    println!("Handshook!");
+
+    tokio::spawn({
+        let private_key = Arc::clone(&self_private_key);
+        let public_key = Arc::clone(&self_public_key);
+        let sender = Arc::clone(&ws_sdr_mutex);
+        let can_type_rx = can_type_rx.clone();
+        let can_type_tx = can_type_tx.clone();
+
+        async move {
+            let mut reader = BufReader::new(tokio::io::stdin());
+            let mut input = String::new();
+
+            loop {
+                let other_key = *client_key_rx1.borrow();
+
+                if can_type_rx.has_changed().is_ok() && *can_type_rx.borrow() {
+                    if other_key != u16::MAX {
+                        println!("Digite sua mensagem: ");
+                        // tokio::io::stdout().flush().await.unwrap();
+
+                        if let Err(e) = reader.read_line(&mut input).await {
+                            eprintln!("Erro ao ler entrada: {}", e);
                             break;
                         }
-                        Err(e) => {
-                            eprintln!("Error receiving message: {}", e);
-                            break;
-                        }
-                        _ => (),
-                    }
-                }
-            }
-        })
-    }.await.unwrap();
 
-    let _send_key_task = {
-        let ws_sender_clone = Arc::clone(&ws_sender_mtx);
-        let pr_key_clone = Arc::clone(&private_key);
-        let pb_key_clone = Arc::clone(&public_key);
+                        let trimmed_input = input.trim().to_string();
 
-        task::spawn({
-            async move {
-                generate_and_set_keys(
-                    &mut *pr_key_clone.lock().await,
-                    &mut *pb_key_clone.lock().await,
-                );
+                        if let Some((encryptor, _)) = choose_algorithm(1).await {
+                            let shared = mod_exp(other_key, *private_key.lock().await, PRIME);
+                            println!("Chave compartilhada: {}", shared);
 
-                let msg = Message::Text(format!("set_public_key:{}", *pb_key_clone.lock().await));
+                            match encryptor.encrypt(&trimmed_input, &shared) {
+                                Ok(encrypted) => {
+                                    match sender.lock().await.send(Message::Text(encrypted)).await {
+                                        Ok(_) => {
+                                            send_round_key(
+                                                &mut *private_key.lock().await,
+                                                &mut *public_key.lock().await,
+                                                &mut *sender.lock().await,
+                                            )
+                                            .await;
 
-                match ws_sender_clone.lock().await.send(msg).await {
-                    Ok(_) => println!("Chave pública enviada ao server!"),
-                    Err(e) => eprintln!("Erro ao enviar chave pública ao server! {}", e),
-                }
-            }
-        })
-    }.await.unwrap();
+                                            println!(
+                                                "Mensagem criptografada e chave pública enviadas!"
+                                            );
 
-    let _receive_public_key_task = {
-        let ws_receiver_clone = Arc::clone(&ws_receiver_mtx);
-        let ws_sender_clone = Arc::clone(&ws_sender_mtx);
-        let key_sender_clone = Arc::clone(&key_sender_mtx);
-
-        task::spawn({
-            async move {
-                loop {
-                    println!("Buscando chave pública...");
-
-                    let msg = Message::Text("get_public_key".to_string());
-
-                    match ws_sender_clone.lock().await.send(msg).await {
-                        Ok(_) => println!("Solicitado a chave pública ao server!"),
-                        Err(e) => eprintln!("Erro ao solicitar chave pública ao server! {}", e),
-                    }
-
-                    if let Some(msg) = ws_receiver_clone.lock().await.next().await {
-                        match msg {
-                            Ok(message) => match message {
-                                Message::Text(text) => {
-                                    if text.starts_with("get_public_key:") {
-                                        if let Some(key) = text.split(':').nth(1) {
-                                            if let Ok(parsed_key) = key.parse() {
-                                                let _ =
-                                                    key_sender_clone.lock().await.send(parsed_key);
-                                                println!("Chave pública recebida! {}", parsed_key);
-                                            }
+                                            can_type_tx.send(false).unwrap();
                                         }
-                                        break;
+                                        Err(e) => {
+                                            eprintln!(
+                                                "Erro ao enviar mensagem criptografada! {}",
+                                                e
+                                            )
+                                        }
                                     }
                                 }
-                                Message::Close(_) => {
-                                    println!("Servidor fechou a conexão");
-                                    break;
-                                }
-                                _ => {}
-                            },
-                            Err(e) => {
-                                println!("Erro ao receber chave pública: {}", e);
-                                break;
+                                Err(e) => eprintln!("Erro ao criptografar mensagem! {}", e),
                             }
+                        }
+
+                        input.clear();
+                    }
+                }
+            }
+        }
+    });
+
+    while let Some(message) = ws_rvr_mutex.lock().await.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                let other_key = *client_key_rx2.borrow();
+
+                if let Ok(uuid) = Uuid::from_str(&text) {
+                    let sender = Arc::clone(&ws_sdr_mutex);
+                    println!("Seu ID é: {}", uuid);
+                    *self_id.lock().await = uuid;
+
+                    let _ = sender
+                        .lock()
+                        .await
+                        .send(Message::Text("get_public_key".to_string()))
+                        .await;
+
+                    println!("Solicitado a chave pública...");
+
+                    continue;
+                }
+
+                if text.starts_with("get_public_key:") {
+                    if let Some(splitted) = text.split(":").nth(1) {
+                        if let Ok(parsed) = splitted.parse::<u16>() {
+                            let can_type_tx = can_type_tx.clone();
+                            // tokio::io::stdout().flush().await.unwrap();
+                            println!("Nova chave recebida! {}", parsed);
+
+                            if client_key_tx.send(parsed).is_err() {
+                                eprintln!("Erro ao alterar chave pública do outro client!")
+                            }
+
+                            can_type_tx.send(true).unwrap();
+                        }
+                    }
+
+                    continue;
+                }
+
+                if other_key != u16::MAX {
+                    let private_key = Arc::clone(&self_private_key);
+                    let private_key = private_key.lock().await;
+
+                    if let Some((_, decryptor)) = choose_algorithm(1).await {
+                        let shared = mod_exp(other_key, *private_key, PRIME);
+                        println!("Chave compartilhada: {}", shared);
+
+                        match decryptor.decrypt(&text, &shared) {
+                            Ok(decrypted) => {
+                                println!("\nMensagem recebida! {}", decrypted);
+                            }
+                            Err(e) => eprintln!("Erro ao descriptografar mensagem! {}", e),
                         }
                     }
                 }
             }
-        })
-    }.await.unwrap();
+            Ok(Message::Close(_)) => {
+                println!("Conexão fechada!");
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("Erro ao receber mensagem! {}", e),
+        }
+    }
+
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Falha ao aguardar sinal de interrupção");
+
+    println!("Programa encerrado.");
 }
 
 fn generate_keys() -> (u16, u16) {
@@ -158,14 +211,31 @@ fn generate_keys() -> (u16, u16) {
     (private_key, public_key)
 }
 
-fn generate_and_set_keys(private_key: &mut u16, public_key: &mut u16) {
+fn generate_and_set_keys(private_key: &mut u16, public_key: &mut u16) -> (u16, u16) {
     let (pr, pb) = generate_keys();
 
     *private_key = pr;
     *public_key = pb;
+
+    (pr, pb)
 }
 
-fn choose_algorithm(option: u16) -> Option<(Box<dyn Encryptor>, Box<dyn Decryptor>)> {
+async fn send_round_key(
+    private_key: &mut u16,
+    public_key: &mut u16,
+    ws_sender: &mut SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+) {
+    let (_, pb) = generate_and_set_keys(private_key, public_key);
+
+    let msg = Message::Text(format!("set_public_key:{}", pb));
+
+    match ws_sender.send(msg).await {
+        Ok(_) => println!("Nova chave pública enviada ao server!"),
+        Err(e) => eprintln!("Erro ao enviar a nova chave pública ao server! {}", e),
+    }
+}
+
+async fn choose_algorithm(option: u16) -> Option<(Box<dyn Encryptor>, Box<dyn Decryptor>)> {
     match option {
         1 => Some((
             Box::new(DiffieHellman::new()),
